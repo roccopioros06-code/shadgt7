@@ -1,0 +1,228 @@
+--- a/src/video_core/renderer_vulkan/vk_rasterizer_native.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer_native.h
+@@ -1238,2 +1238,17 @@
+     void SyncDepthTwin(Native::ImageEntry& entry);
++    /// FIX-AMD-003: a draw that samples a colour target it also draws into (GT7's PS4 Pro
++    /// atmosphere pass reads the checkerboard scene it blends into) reads a copy of the target
++    /// made just before it, where the device can't mark the feedback loop
++    /// (VK_EXT_attachment_feedback_loop_layout/dynamic_state missing: AMD). RYGT_FEEDBACK_COPY=0
++    /// off, =1 on everywhere.
++    struct FeedbackCopy {
++        const Native::Rhi::Image* source = nullptr;
++        std::shared_ptr<Native::ImageEntry> copy;
++        bool initialized = false;
++    };
++    std::unordered_map<const Native::ImageEntry*, FeedbackCopy> feedback_copies;
++    std::vector<std::shared_ptr<Native::ImageEntry>> retired_feedback_copies;
++    u64 feedback_copies_made = 0;
++    void CopyFeedbackTargets(const Native::ImageEntry* const* colors, size_t count,
++                             const RenderState& wanted, DrawBindings& b);
+     /// FIX-210: before a draw into a target that is mips or layers of a larger one (FIX-197),
+--- a/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp
+@@ -8647,5 +8647,196 @@
+     ++s.commands;
+ }
+ 
++static bool FeedbackCopyOn(const Instance& instance) {
++    static const int mode = [] {
++        const char* env = std::getenv("RYGT_FEEDBACK_COPY");
++        if (env && env[0] == '0') {
++            return 0;
++        }
++        if (env && env[0] == '1') {
++            return 1;
++        }
++        return 2;
++    }();
++    return mode == 1 || (mode == 2 && !instance.IsAttachmentFeedbackLoopLayoutSupported());
++}
++
++void NativeRenderer::CopyFeedbackTargets(const Native::ImageEntry* const* colors, size_t count,
++                                         const RenderState& wanted, DrawBindings& b) {
++    // FIX-AMD-003: GT7's PS4 Pro atmosphere pass (fs 0x2b49e735) draws into the 1920x2160
++    // checkerboard scene and samples that same picture to blend its fog over it. Without
++    // VK_EXT_attachment_feedback_loop_* (an RX 6900 XT has neither) the attachment state is not
++    // marked and the read is undefined: on AMD 8x4-pixel blocks (the bottom halves of 8x8 tiles)
++    // read nothing of the scene, and the pass left only its fog there, in horizontal dashes
++    // over the whole picture. The draw now samples a copy of the target taken just before it,
++    // which is what it reads on the console (its own pixel, before its write).
++    if (b.sampled.empty() || count == 0 || !FeedbackCopyOn(r.instance)) {
++        return;
++    }
++    Stream& s = stream;
++    bool copied = false;
++    bool resumed_pass = false;
++    RenderState current{};
++    for (size_t c = 0; c < count; ++c) {
++        const Native::ImageEntry* entry = colors[c];
++        if (!entry || !entry->image || entry->info.props.is_depth ||
++            std::ranges::find(b.sampled, entry) == b.sampled.end()) {
++            continue;
++        }
++        // FIX-AMD-003 (diagnosis): what happens to each draw that samples its own colour target.
++        static std::atomic<u32> big_logged{}, small_logged{};
++        const bool big = entry->info.size.width >= 1024;
++        const auto note = [&](const char* what, size_t n) {
++            std::atomic<u32>& counter = big ? big_logged : small_logged;
++            const u32 k = counter.fetch_add(1, std::memory_order_relaxed);
++            if (k < (big ? 400u : 20u) || k % 2000 == 0) {
++                LOG_WARNING(Render_Vulkan,
++                            "FIX-AMD-003 diag #{}: target {:#x} {}x{} frame {} {} ({}; {} images, {} "
++                            "sampled, pass open {})",
++                            k, entry->info.guest_address, entry->info.size.width,
++                            entry->info.size.height, frame, what, n, b.images.size(),
++                            b.sampled.size(), s.rendering);
++            }
++        };
++        if (!(vk::ImageUsageFlags{entry->backend_usage} & vk::ImageUsageFlagBits::eTransferSrc)) {
++            note("skipped: no transfer use", 0);
++            continue;
++        }
++        // The views of this target that the draw binds, and the views they ask for.
++        boost::container::small_vector<std::pair<size_t, std::pair<VideoCore::ImageViewInfo, ViewUse>>, 4>
++            slots;
++        {
++            std::scoped_lock lock{views_mutex};
++            const auto it = views.find(entry);
++            if (it == views.end()) {
++                note("skipped: no views recorded", 0);
++                continue;
++            }
++            for (size_t i = 0; i < b.images.size(); ++i) {
++                const vk::ImageView bound = b.images[i].imageView;
++                if (!bound) {
++                    continue;
++                }
++                for (const auto& record : it->second) {
++                    if (record.use != ViewUse::Storage && record.use != ViewUse::Attachment &&
++                        *record.view == bound) {
++                        slots.push_back({i, {record.info, record.use}});
++                        break;
++                    }
++                }
++            }
++        }
++        if (slots.empty()) {
++            note("skipped: no bound view of it found", 0);
++            continue;
++        }
++        auto& fc = feedback_copies[entry];
++        if (fc.source != entry->image.get() || !fc.copy) {
++            if (fc.copy) {
++                retired_feedback_copies.push_back(std::move(fc.copy)); // the GPU may still read it
++            }
++            fc = {};
++            auto made = MakeImage(entry->info, false);
++            if (!made.image) {
++                static std::atomic<u32> logged{};
++                if (Sample(logged)) {
++                    LOG_WARNING(Render_Vulkan, "FIX-AMD-003: no copy image for target {:#x}",
++                                entry->info.guest_address);
++                }
++                feedback_copies.erase(entry);
++                continue;
++            }
++            fc.copy = std::make_shared<Native::ImageEntry>();
++            fc.copy->info = entry->info;
++            fc.copy->image = std::move(made.image);
++            fc.copy->backend_usage = made.usage;
++            fc.copy->backend_features = made.features;
++            fc.source = entry->image.get();
++            if (feedback_copies_made++ < 8) {
++                LOG_WARNING(Render_Vulkan,
++                            "FIX-AMD-003: target {:#x} {}x{} is sampled by a draw into it: the "
++                            "draw reads a copy (no attachment feedback loop on this device)",
++                            entry->info.guest_address, entry->image->Desc().width,
++                            entry->image->Desc().height);
++            }
++        }
++        const auto& src_desc = entry->image->Desc();
++        const auto& dst_desc = fc.copy->image->Desc();
++        if (src_desc.width != dst_desc.width || src_desc.height != dst_desc.height ||
++            src_desc.samples != dst_desc.samples || src_desc.format != dst_desc.format) {
++            note("skipped: copy image differs", 0);
++            continue;
++        }
++        if (!copied) {
++            // The draw continues the open pass: it resumes after the copy without its clears.
++            resumed_pass = s.rendering && s.render == wanted;
++            current = s.render;
++            GlobalBarrier(); // ends the pass; what was drawn into the target is written
++            copied = true;
++        }
++        const vk::Image dst{Handle<VkImage_T>(fc.copy->image->NativeHandle())};
++        if (!fc.initialized) {
++            const vk::ImageMemoryBarrier2 transition{
++                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
++                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
++                .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
++                .oldLayout = vk::ImageLayout::eUndefined,
++                .newLayout = vk::ImageLayout::eGeneral,
++                .image = dst,
++                .subresourceRange{.aspectMask = vk::ImageAspectFlagBits::eColor,
++                                  .baseMipLevel = 0,
++                                  .levelCount = VK_REMAINING_MIP_LEVELS,
++                                  .baseArrayLayer = 0,
++                                  .layerCount = VK_REMAINING_ARRAY_LAYERS},
++            };
++            s.cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
++                                                      .pImageMemoryBarriers = &transition});
++            fc.initialized = true;
++        }
++        const u32 mips = std::max<u32>(std::min(src_desc.mips, dst_desc.mips), 1u);
++        const u32 layers = std::max<u32>(std::min(src_desc.layers, dst_desc.layers), 1u);
++        for (u32 m = 0; m < mips; ++m) {
++            const vk::ImageCopy region{
++                .srcSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
++                                .mipLevel = m,
++                                .baseArrayLayer = 0,
++                                .layerCount = layers},
++                .srcOffset = {0, 0, 0},
++                .dstSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
++                                .mipLevel = m,
++                                .baseArrayLayer = 0,
++                                .layerCount = layers},
++                .dstOffset = {0, 0, 0},
++                .extent = {std::max(src_desc.width >> m, 1u), std::max(src_desc.height >> m, 1u),
++                           std::max(src_desc.depth >> m, 1u)},
++            };
++            CmdBuf{s.cmd}.copyImage(vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())},
++                                    vk::ImageLayout::eGeneral, dst, vk::ImageLayout::eGeneral,
++                                    region);
++        }
++        ++s.commands;
++        // The draw's descriptors (written later, from b.images) name the copy's views.
++        for (const auto& [index, asked] : slots) {
++            if (const vk::ImageView view = View(*fc.copy, asked.first, asked.second)) {
++                b.images[index].imageView = view;
++            }
++        }
++        note("copied; slots rebound", slots.size());
++    }
++    if (copied) {
++        GlobalBarrier(); // the copies are written before the draw samples them
++        if (resumed_pass) {
++            RenderState resumed = current;
++            for (u32 i = 0; i < resumed.num_color_attachments; ++i) {
++                resumed.color_attachments[i].is_clear = false;
++            }
++            resumed.depth_stencil_attachment.depth_clear = false;
++            resumed.depth_stencil_attachment.stencil_clear = false;
++            BeginRendering(resumed);
++            s.render = current; // its clears are done; the same pass to the draw
++        }
++    }
++}
++
+ void NativeRenderer::SyncDepthTwin(Native::ImageEntry& entry) {
+     // FIX-212: on the PS4 a depth buffer and a colour picture of its layout at its address are
+@@ -9853,6 +10044,8 @@
+         if (stats.source_copies != copies_before) {
+             GlobalBarrier(); // the copies are done before the draw writes the targets
+         }
+     }
++    CopyFeedbackTargets(targets.colors.data(), targets.colors.size(),
++                        hud_black_state ? *hud_black_state : targets.state, b); // FIX-AMD-003
+     {
+         // DIAG-214 (diagnosis, RYGT_DIAG_RECORD_DRAWS=1): every 30th frame, each draw reading a
