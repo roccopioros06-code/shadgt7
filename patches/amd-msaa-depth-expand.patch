@@ -1,0 +1,414 @@
+--- a/src/video_core/renderer_vulkan/vk_rasterizer_native.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer_native.h
+@@ -1238,2 +1238,27 @@
+     void SyncDepthTwin(Native::ImageEntry& entry);
++    /// FIX-AMD-006: a multisampled depth target that a draw or dispatch samples (the PS4 Pro
++    /// checkerboard's 2-sample depth) is read from a picture made for it just before: its
++    /// sample 0 resolved by the depth unit into a 1-sample depth image, then drawn into a colour
++    /// image of the same sample count (R32). On AMD the depth read directly, or copied, came back
++    /// as far in 8x4-pixel blocks; resolved by the depth unit it is whole. RYGT_MSAA_DEPTH_EXPAND=0
++    /// off, =1 on everywhere.
++    struct DepthExpand {
++        const Native::Rhi::Image* source = nullptr;
++        std::unique_ptr<Native::Rhi::Image> resolved;
++        std::unique_ptr<Native::Rhi::Image> expanded;
++        std::unique_ptr<Native::Rhi::ImageView> source_view;
++        std::unique_ptr<Native::Rhi::ImageView> resolved_view;
++        vk::UniqueImageView expanded_view;
++        bool initialized = false;
++    };
++    std::unordered_map<const Native::ImageEntry*, DepthExpand> depth_expands;
++    std::vector<DepthExpand> retired_depth_expands;
++    vk::UniqueDescriptorSetLayout expand_set_layout;
++    vk::UniquePipelineLayout expand_layout;
++    vk::ShaderModule expand_vs{};
++    vk::ShaderModule expand_fs{};
++    std::array<vk::UniquePipeline, 17> expand_pipelines;
++    bool EnsureExpandPipeline(u32 samples);
++    void ExpandSampledDepth(const Native::ImageEntry* attached, const RenderState* wanted,
++                            DrawBindings& b);
+     /// FIX-210: before a draw into a target that is mips or layers of a larger one (FIX-197),
+--- a/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp
+@@ -18,3 +18,5 @@
+ #include "video_core/renderer_vulkan/upload_memory_recovery.h"
+ #include "video_core/host_shaders/native_region_writeback_comp.h"
++#include "video_core/host_shaders/fs_tri_vert.h"     // FIX-AMD-006
++#include "video_core/host_shaders/ms_image_blit_frag.h" // FIX-AMD-006
+ #include "video_core/renderer_vulkan/vk_shader_util.h"
+@@ -8647,5 +8649,357 @@
+     ++s.commands;
+ }
+ 
++static bool DepthExpandOn(const Instance& instance) {
++    static const int mode = [] {
++        const char* env = std::getenv("RYGT_MSAA_DEPTH_EXPAND");
++        if (env && env[0] == '0') {
++            return 0;
++        }
++        if (env && env[0] == '1') {
++            return 1;
++        }
++        return 2;
++    }();
++    return mode == 1 || (mode == 2 && !instance.IsAttachmentFeedbackLoopLayoutSupported());
++}
++
++bool NativeRenderer::EnsureExpandPipeline(u32 samples) {
++    if (samples == 0 || samples >= expand_pipelines.size()) {
++        return false;
++    }
++    if (expand_pipelines[samples]) {
++        return true;
++    }
++    const vk::Device dev = r.instance.GetDevice();
++    if (!expand_layout) {
++        expand_vs = Vulkan::CompileSPV(FS_TRI_VERT, dev);
++        expand_fs = Vulkan::CompileSPV(MS_IMAGE_BLIT_FRAG, dev);
++        const vk::DescriptorSetLayoutBinding binding{
++            .binding = 0,
++            .descriptorType = vk::DescriptorType::eSampledImage,
++            .descriptorCount = 1,
++            .stageFlags = vk::ShaderStageFlagBits::eFragment,
++        };
++        auto [set_result, set_layout] =
++            dev.createDescriptorSetLayoutUnique(vk::DescriptorSetLayoutCreateInfo{
++                .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
++                .bindingCount = 1,
++                .pBindings = &binding,
++            });
++        if (set_result != vk::Result::eSuccess) {
++            return false;
++        }
++        expand_set_layout = std::move(set_layout);
++        const vk::DescriptorSetLayout set = *expand_set_layout;
++        auto [layout_result, layout] = dev.createPipelineLayoutUnique(vk::PipelineLayoutCreateInfo{
++            .setLayoutCount = 1,
++            .pSetLayouts = &set,
++        });
++        if (layout_result != vk::Result::eSuccess) {
++            return false;
++        }
++        expand_layout = std::move(layout);
++    }
++    const vk::PipelineInputAssemblyStateCreateInfo input_assembly{
++        .topology = vk::PrimitiveTopology::eTriangleList,
++    };
++    const vk::PipelineMultisampleStateCreateInfo multisampling{
++        .rasterizationSamples = static_cast<vk::SampleCountFlagBits>(samples),
++    };
++    const vk::PipelineDepthStencilStateCreateInfo depth_state{
++        .depthTestEnable = false,
++        .depthWriteEnable = false,
++        .depthCompareOp = vk::CompareOp::eAlways,
++    };
++    const std::array dynamic_states = {vk::DynamicState::eViewportWithCount,
++                                       vk::DynamicState::eScissorWithCount};
++    const vk::PipelineDynamicStateCreateInfo dynamic_info{
++        .dynamicStateCount = static_cast<u32>(dynamic_states.size()),
++        .pDynamicStates = dynamic_states.data(),
++    };
++    const std::array<vk::PipelineShaderStageCreateInfo, 2> stages{{
++        {.stage = vk::ShaderStageFlagBits::eVertex, .module = expand_vs, .pName = "main"},
++        {.stage = vk::ShaderStageFlagBits::eFragment, .module = expand_fs, .pName = "main"},
++    }};
++    const vk::Format color_format = vk::Format::eR32Sfloat;
++    const vk::PipelineRenderingCreateInfo rendering_ci{
++        .colorAttachmentCount = 1,
++        .pColorAttachmentFormats = &color_format,
++    };
++    const vk::PipelineColorBlendAttachmentState attachment{
++        .blendEnable = false,
++        .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
++                          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
++    };
++    const vk::PipelineColorBlendStateCreateInfo color_blending{
++        .attachmentCount = 1,
++        .pAttachments = &attachment,
++    };
++    const vk::PipelineViewportStateCreateInfo viewport_info{};
++    const vk::PipelineVertexInputStateCreateInfo vertex_input_info{};
++    const vk::PipelineRasterizationStateCreateInfo raster_state{.lineWidth = 1.f};
++    auto [pipeline_result, pipeline] =
++        dev.createGraphicsPipelineUnique(VK_NULL_HANDLE, vk::GraphicsPipelineCreateInfo{
++                                                             .pNext = &rendering_ci,
++                                                             .stageCount = 2,
++                                                             .pStages = stages.data(),
++                                                             .pVertexInputState = &vertex_input_info,
++                                                             .pInputAssemblyState = &input_assembly,
++                                                             .pViewportState = &viewport_info,
++                                                             .pRasterizationState = &raster_state,
++                                                             .pMultisampleState = &multisampling,
++                                                             .pDepthStencilState = &depth_state,
++                                                             .pColorBlendState = &color_blending,
++                                                             .pDynamicState = &dynamic_info,
++                                                             .layout = *expand_layout,
++                                                         });
++    if (pipeline_result != vk::Result::eSuccess) {
++        return false;
++    }
++    expand_pipelines[samples] = std::move(pipeline);
++    return true;
++}
++
++void NativeRenderer::ExpandSampledDepth(const Native::ImageEntry* attached,
++                                        const RenderState* wanted, DrawBindings& b) {
++    // FIX-AMD-006: GT7's PS4 Pro mode draws its checkerboard with a 2-sample depth buffer (AMD
++    // mixed attachment samples: 1-sample colour) that its atmosphere pass (and a compute pass
++    // before it) reads through an MSAA T#. On an RX 6900 XT, read in the GENERAL layout, 8x4-pixel
++    // blocks (the bottom halves of 8x8 tiles) came back as far: the pass painted only fog or
++    // sky there, in horizontal dashes all over the picture. A transfer copy of the depth read
++    // worse; the depth unit's own resolve (the frame dump's) reads it whole. So the work reads a
++    // picture made from that resolve: sample 0 resolved into a 1-sample depth image, drawn into
++    // an R32 colour image with the depth's sample count, whose view replaces the depth's.
++    if (b.sampled.empty() || !DepthExpandOn(r.instance)) {
++        return;
++    }
++    Stream& s = stream;
++    bool began = false;
++    bool resumed_pass = false;
++    RenderState current{};
++    boost::container::small_vector<const Native::ImageEntry*, 4> done;
++    for (const Native::ImageEntry* entry : b.sampled) {
++        if (!entry || !entry->image || !entry->info.props.is_depth || entry == attached ||
++            entry->image->Desc().samples <= 1 || std::ranges::find(done, entry) != done.end()) {
++            continue;
++        }
++        done.push_back(entry);
++        static std::atomic<u32> logged{};
++        const auto note = [&](const char* what, size_t n) {
++            const u32 k = logged.fetch_add(1, std::memory_order_relaxed);
++            if (k < 100 || k % 3000 == 0) {
++                LOG_WARNING(Render_Vulkan,
++                            "FIX-AMD-006 #{}: depth {:#x} {}x{} ({} samples) frame {} {} ({}; {})",
++                            k, entry->info.guest_address, entry->info.size.width,
++                            entry->info.size.height, entry->image->Desc().samples, frame, what, n,
++                            wanted ? "draw" : "dispatch");
++            }
++        };
++        const auto& sd = entry->image->Desc();
++        if (sd.layers != 1 || sd.dim != Native::Rhi::ImageDim::D2) {
++            note("skipped: layered", 0);
++            continue;
++        }
++        boost::container::small_vector<size_t, 4> slots;
++        {
++            std::scoped_lock lock{views_mutex};
++            const auto it = views.find(entry);
++            if (it == views.end()) {
++                note("skipped: no views recorded", 0);
++                continue;
++            }
++            for (size_t i = 0; i < b.images.size(); ++i) {
++                const vk::ImageView bound = b.images[i].imageView;
++                if (!bound) {
++                    continue;
++                }
++                for (const auto& record : it->second) {
++                    if (record.use != ViewUse::Storage && record.use != ViewUse::Attachment &&
++                        *record.view == bound) {
++                        slots.push_back(i);
++                        break;
++                    }
++                }
++            }
++        }
++        if (slots.empty()) {
++            note("skipped: no bound view of it found", 0);
++            continue;
++        }
++        auto& ex = depth_expands[entry];
++        if (ex.source != entry->image.get() || !ex.expanded) {
++            if (ex.resolved || ex.expanded) {
++                retired_depth_expands.push_back(std::move(ex)); // the GPU may still read them
++            }
++            ex = {};
++            if (!EnsureExpandPipeline(sd.samples)) {
++                note("skipped: no pipeline", 0);
++                depth_expands.erase(entry);
++                continue;
++            }
++            auto resolved_desc = sd;
++            resolved_desc.samples = 1;
++            resolved_desc.mips = 1;
++            ex.resolved = device->CreateImage(resolved_desc);
++            Native::Rhi::ImageDesc expanded_desc{};
++            expanded_desc.dim = Native::Rhi::ImageDim::D2;
++            expanded_desc.format =
++                Native::Rhi::FormatFromVk(static_cast<u32>(vk::Format::eR32Sfloat));
++            expanded_desc.width = sd.width;
++            expanded_desc.height = sd.height;
++            expanded_desc.samples = sd.samples;
++            expanded_desc.usage = Native::Rhi::ImageUsageColorTarget | Native::Rhi::ImageUsageSampled;
++            expanded_desc.name = "FIX-AMD-006 expanded depth";
++            ex.expanded = device->CreateImage(expanded_desc);
++            if (!ex.resolved || !ex.expanded) {
++                note("skipped: no images", 0);
++                depth_expands.erase(entry);
++                continue;
++            }
++            Native::Rhi::ImageViewDesc depth_view{};
++            depth_view.aspect = Native::Rhi::AspectDepth;
++            ex.source_view = device->CreateImageView(entry->image.get(), depth_view);
++            ex.resolved_view = device->CreateImageView(ex.resolved.get(), depth_view);
++            auto [view_result, view] =
++                r.instance.GetDevice().createImageViewUnique(vk::ImageViewCreateInfo{
++                    .image = vk::Image{Handle<VkImage_T>(ex.expanded->NativeHandle())},
++                    .viewType = vk::ImageViewType::e2D,
++                    .format = vk::Format::eR32Sfloat,
++                    .subresourceRange{.aspectMask = vk::ImageAspectFlagBits::eColor,
++                                      .baseMipLevel = 0,
++                                      .levelCount = 1,
++                                      .baseArrayLayer = 0,
++                                      .layerCount = 1},
++                });
++            if (!ex.source_view || !ex.resolved_view || view_result != vk::Result::eSuccess) {
++                note("skipped: no views", 0);
++                depth_expands.erase(entry);
++                continue;
++            }
++            ex.expanded_view = std::move(view);
++            ex.source = entry->image.get();
++        }
++        if (!began) {
++            resumed_pass = wanted && s.rendering && s.render == *wanted;
++            current = s.render;
++            GlobalBarrier(); // ends the pass; the depth writes before are done
++            began = true;
++        }
++        const vk::ImageAspectFlags depth_aspects =
++            entry->info.props.has_stencil
++                ? vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil
++                : vk::ImageAspectFlagBits::eDepth;
++        if (!ex.initialized) {
++            const std::array<vk::ImageMemoryBarrier2, 2> transitions{{
++                {.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
++                 .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
++                 .dstAccessMask =
++                     vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
++                 .oldLayout = vk::ImageLayout::eUndefined,
++                 .newLayout = vk::ImageLayout::eGeneral,
++                 .image = vk::Image{Handle<VkImage_T>(ex.resolved->NativeHandle())},
++                 .subresourceRange{.aspectMask = depth_aspects,
++                                   .baseMipLevel = 0,
++                                   .levelCount = 1,
++                                   .baseArrayLayer = 0,
++                                   .layerCount = 1}},
++                {.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
++                 .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
++                 .dstAccessMask =
++                     vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
++                 .oldLayout = vk::ImageLayout::eUndefined,
++                 .newLayout = vk::ImageLayout::eGeneral,
++                 .image = vk::Image{Handle<VkImage_T>(ex.expanded->NativeHandle())},
++                 .subresourceRange{.aspectMask = vk::ImageAspectFlagBits::eColor,
++                                   .baseMipLevel = 0,
++                                   .levelCount = 1,
++                                   .baseArrayLayer = 0,
++                                   .layerCount = 1}},
++            }};
++            s.cmd.pipelineBarrier2(vk::DependencyInfo{
++                .imageMemoryBarrierCount = static_cast<u32>(transitions.size()),
++                .pImageMemoryBarriers = transitions.data(),
++            });
++            ex.initialized = true;
++        }
++        const vk::Extent2D extent{sd.width, sd.height};
++        const vk::ImageView resolved_view{Handle<VkImageView_T>(ex.resolved_view->NativeHandle())};
++        // The depth unit resolves sample 0 (as the frame dump does).
++        const vk::RenderingAttachmentInfo depth_attachment{
++            .imageView = vk::ImageView{Handle<VkImageView_T>(ex.source_view->NativeHandle())},
++            .imageLayout = vk::ImageLayout::eGeneral,
++            .resolveMode = vk::ResolveModeFlagBits::eSampleZero,
++            .resolveImageView = resolved_view,
++            .resolveImageLayout = vk::ImageLayout::eGeneral,
++            .loadOp = vk::AttachmentLoadOp::eLoad,
++            .storeOp = vk::AttachmentStoreOp::eStore,
++        };
++        s.cmd.beginRendering(vk::RenderingInfo{
++            .renderArea{.extent = extent},
++            .layerCount = 1,
++            .pDepthAttachment = &depth_attachment,
++        });
++        s.cmd.endRendering();
++        GlobalBarrier();
++        // Then drawn into every sample of the colour picture the work reads.
++        const vk::RenderingAttachmentInfo color_attachment{
++            .imageView = *ex.expanded_view,
++            .imageLayout = vk::ImageLayout::eGeneral,
++            .loadOp = vk::AttachmentLoadOp::eDontCare,
++            .storeOp = vk::AttachmentStoreOp::eStore,
++        };
++        s.cmd.beginRendering(vk::RenderingInfo{
++            .renderArea{.extent = extent},
++            .layerCount = 1,
++            .colorAttachmentCount = 1,
++            .pColorAttachments = &color_attachment,
++        });
++        s.cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *expand_pipelines[sd.samples]);
++        const vk::DescriptorImageInfo image_info{
++            .imageView = resolved_view,
++            .imageLayout = vk::ImageLayout::eGeneral,
++        };
++        const vk::WriteDescriptorSet write{
++            .dstBinding = 0,
++            .descriptorCount = 1,
++            .descriptorType = vk::DescriptorType::eSampledImage,
++            .pImageInfo = &image_info,
++        };
++        s.cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *expand_layout, 0, write);
++        s.cmd.setViewportWithCount(vk::Viewport{
++            .x = 0.f,
++            .y = 0.f,
++            .width = static_cast<float>(extent.width),
++            .height = static_cast<float>(extent.height),
++            .minDepth = 0.f,
++            .maxDepth = 1.f,
++        });
++        s.cmd.setScissorWithCount(vk::Rect2D{.offset = {0, 0}, .extent = extent});
++        s.cmd.draw(3, 1, 0, 0);
++        s.cmd.endRendering();
++        GlobalBarrier();
++        for (const size_t index : slots) {
++            b.images[index].imageView = *ex.expanded_view;
++        }
++        note("expanded; slots rebound", slots.size());
++    }
++    if (began) {
++        // The list's own graphics state is bound again before its next draw.
++        s.pipeline = vk::Pipeline{};
++        ForgetBindings(s);
++        s.dynamic.Invalidate();
++        if (resumed_pass) {
++            RenderState resumed = current;
++            for (u32 i = 0; i < resumed.num_color_attachments; ++i) {
++                resumed.color_attachments[i].is_clear = false;
++            }
++            resumed.depth_stencil_attachment.depth_clear = false;
++            resumed.depth_stencil_attachment.stencil_clear = false;
++            BeginRendering(resumed);
++            s.render = current;
++        }
++    }
++}
++
+ void NativeRenderer::SyncDepthTwin(Native::ImageEntry& entry) {
+     // FIX-212: on the PS4 a depth buffer and a colour picture of its layout at its address are
+@@ -9853,6 +10207,8 @@
+         if (stats.source_copies != copies_before) {
+             GlobalBarrier(); // the copies are done before the draw writes the targets
+         }
+     }
++    ExpandSampledDepth(targets.depth, hud_black_state ? &*hud_black_state : &targets.state,
++                       b); // FIX-AMD-006
+     {
+         // DIAG-214 (diagnosis, RYGT_DIAG_RECORD_DRAWS=1): every 30th frame, each draw reading a
+@@ -12132,7 +12488,8 @@
+     if (RunNeedsBarrier(s, b, program, recorded, texel)) { // PERF-GT7-043, 057
+         GlobalBarrier();
+     } else {
+         EndRendering();
+     }
++    ExpandSampledDepth(nullptr, nullptr, b); // FIX-AMD-006
+     // PERF-GT7-057; FIX-GT7-081: a dispatch that stores without a key ends the run's exemptions.
+     s.run_texels.Note(texel ? b.stored[0]->info.guest_address : 0, texel, !b.stored.empty());
